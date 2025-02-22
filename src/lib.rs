@@ -1,11 +1,8 @@
 #![doc = include_str!("../README.md")]
 
-use crate::{
-    packet::IpStackPacketProtocol,
-    stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport},
-};
+use crate::stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport};
 use ahash::AHashMap;
-use packet::{NetworkPacket, NetworkTuple};
+use packet::{NetworkPacket, NetworkTuple, TransportHeader};
 use std::{
     collections::hash_map::Entry::{Occupied, Vacant},
     time::Duration,
@@ -162,7 +159,7 @@ fn process_device_read(
         return Ok(());
     };
 
-    if let IpStackPacketProtocol::Unknown = packet.transport_protocol() {
+    if let TransportHeader::Unknown = packet.transport_header() {
         let stream = IpStackStream::UnknownTransport(IpStackUnknownTransport::new(
             packet.src_addr().ip(),
             packet.dst_addr().ip(),
@@ -195,12 +192,13 @@ fn process_device_read(
 }
 
 fn create_stream(packet: NetworkPacket, cfg: &IpStackConfig, up_pkt_sender: PacketSender) -> Result<(PacketSender, IpStackStream)> {
-    match packet.transport_protocol() {
-        IpStackPacketProtocol::Tcp(h) => {
+    match packet.transport_header() {
+        TransportHeader::Tcp(h) => {
+            let h: TcpHeaderWrapper = h.into();
             let stream = IpStackTcpStream::new(packet.src_addr(), packet.dst_addr(), h, up_pkt_sender, cfg.mtu, cfg.tcp_timeout)?;
             Ok((stream.stream_sender(), IpStackStream::Tcp(stream)))
         }
-        IpStackPacketProtocol::Udp => {
+        TransportHeader::Udp(_) => {
             let stream = IpStackUdpStream::new(
                 packet.src_addr(),
                 packet.dst_addr(),
@@ -211,7 +209,7 @@ fn create_stream(packet: NetworkPacket, cfg: &IpStackConfig, up_pkt_sender: Pack
             );
             Ok((stream.stream_sender(), IpStackStream::Udp(stream)))
         }
-        IpStackPacketProtocol::Unknown => {
+        TransportHeader::Unknown => {
             unreachable!()
         }
     }
@@ -223,7 +221,7 @@ async fn process_upstream_recv<Device: AsyncWrite + Unpin + 'static>(
     device: &mut Device,
     #[cfg(unix)] packet_information: bool,
 ) -> Result<()> {
-    if up_packet.ttl() == 0 {
+    if up_packet.ttl() == DROP_TTL {
         let network_tuple = up_packet.reverse_network_tuple();
         sessions.remove(&network_tuple);
         log::trace!("session removed: {}", network_tuple);
@@ -243,7 +241,7 @@ async fn process_upstream_recv<Device: AsyncWrite + Unpin + 'static>(
         }
     }
     device.write_all(&packet_bytes).await?;
-    // device.flush().await.unwrap();
+    // device.flush().await?;
 
     Ok(())
 }

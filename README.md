@@ -34,7 +34,7 @@ async fn main() {
 
     #[cfg(target_os = "windows")]
     config.platform_config(|config| {
-        config.device_guid(Some(12324323423423434234_u128));
+        config.device_guid(12324323423423434234_u128);
     });
 
     let mut ipstack_config = ipstack::IpStackConfig::default();
