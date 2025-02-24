@@ -24,6 +24,9 @@ pub enum IpStackError {
 
     #[error("Send Error {0}")]
     SendError(#[from] tokio::sync::mpsc::error::SendError<crate::stream::IpStackStream>),
+
+    #[error("Send Error {0}")]
+    SendErrorPacket(#[from] tokio::sync::mpsc::error::SendError<crate::packet::NetworkPacket>),
 }
 
 impl From<IpStackError> for std::io::Error {
