@@ -4,6 +4,7 @@ pub use self::tcp::IpStackTcpStream;
 pub use self::udp::IpStackUdpStream;
 pub use self::unknown::IpStackUnknownTransport;
 
+mod reno;
 mod seqnum;
 mod tcb;
 mod tcp;

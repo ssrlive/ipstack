@@ -1,8 +1,8 @@
-use super::seqnum::SeqNum;
+use super::{reno::Reno, seqnum::SeqNum};
 use etherparse::TcpHeader;
 use std::collections::{BTreeMap, VecDeque};
 
-const MAX_UNACK: u32 = 1024 * 16; // 16KB
+// const MAX_UNACK: u32 = 1024 * 16; // 16KB
 const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -35,15 +35,14 @@ pub(super) struct Tcb {
     seq: SeqNum,
     ack: SeqNum,
     last_received_ack: SeqNum,
-    send_window: u16,
     state: TcpState,
-    avg_send_window: Average,
+    reno: Reno,
     inflight_packets: VecDeque<InflightPacket>,
     unordered_packets: BTreeMap<SeqNum, UnorderedPacket>,
 }
 
 impl Tcb {
-    pub(super) fn new(ack: SeqNum) -> Tcb {
+    pub(super) fn new(ack: SeqNum, mss: usize) -> Tcb {
         #[cfg(debug_assertions)]
         let seq = 100;
         #[cfg(not(debug_assertions))]
@@ -52,9 +51,8 @@ impl Tcb {
             seq: seq.into(),
             ack,
             last_received_ack: seq.into(),
-            send_window: u16::MAX,
             state: TcpState::Listen,
-            avg_send_window: Average::default(),
+            reno: Reno::new(mss),
             inflight_packets: VecDeque::new(),
             unordered_packets: BTreeMap::new(),
         }
@@ -104,14 +102,18 @@ impl Tcb {
         self.state
     }
     pub(super) fn update_send_window(&mut self, window: u16) {
-        self.avg_send_window.update(window as u64);
-        self.send_window = window;
+        self.reno.set_remote_window(window as usize); // update remote window
     }
-    pub(super) fn get_send_window(&self) -> u16 {
-        self.send_window
+    pub(super) fn get_effective_send_window(&self) -> u16 {
+        self.reno.window().min(u16::MAX as usize) as u16 // limit to u16 range
     }
-    pub(super) fn get_avg_send_window(&self) -> u64 {
-        self.avg_send_window.get()
+    pub(crate) fn on_duplicate_ack(&mut self) {
+        self.reno.on_duplicate_ack();
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn on_retransmit(&mut self) {
+        self.reno.on_retransmit();
     }
     pub(super) fn get_recv_window(&self) -> u16 {
         self.get_available_read_buffer_size() as u16
@@ -133,6 +135,7 @@ impl Tcb {
         let rcvd_ack = SeqNum(tcp_header.acknowledgment_number);
         let rcvd_seq = SeqNum(tcp_header.sequence_number);
         let rcvd_window = tcp_header.window_size;
+        let cwnd = self.reno.window() as u16;
         let res = if rcvd_ack > self.seq {
             PacketStatus::Invalid
         } else {
@@ -141,7 +144,7 @@ impl Tcb {
                 std::cmp::Ordering::Equal => {
                     if !payload.is_empty() {
                         PacketStatus::NewPacket
-                    } else if self.send_window == rcvd_window && self.seq != self.last_received_ack {
+                    } else if cwnd == rcvd_window && self.seq != self.last_received_ack {
                         PacketStatus::RetransmissionRequest
                     } else if self.ack - 1 == rcvd_seq {
                         PacketStatus::KeepAlive
@@ -159,7 +162,7 @@ impl Tcb {
             }
         };
         #[rustfmt::skip]
-        log::trace!("recieved {{ ack = {rcvd_ack}, seq = {rcvd_seq}, window = {rcvd_window} }}, self {{ ack = {}, seq = {}, send_window = {} }}, {res:?}", self.ack, self.seq, self.send_window);
+        log::trace!("recieved {{ ack = {rcvd_ack}, seq = {rcvd_seq}, window = {rcvd_window} }}, self {{ ack = {}, seq = {}, send_window = {cwnd} }}, {res:?}", self.ack, self.seq);
         res
     }
 
@@ -185,6 +188,7 @@ impl Tcb {
                     inflight_packet.seq = ack;
                     self.inflight_packets.push_back(inflight_packet);
                 }
+                self.reno.on_ack(distance); // recived ACK, update Reno's cwnd
             }
             self.inflight_packets.retain(|p| {
                 let last_byte = p.seq + (p.payload.len() as u32);
@@ -203,22 +207,8 @@ impl Tcb {
     }
 
     pub fn is_send_buffer_full(&self) -> bool {
-        (self.seq - self.last_received_ack).0 >= MAX_UNACK
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct Average {
-    pub(crate) avg: u64,
-    pub(crate) count: u64,
-}
-impl Average {
-    fn update(&mut self, value: u64) {
-        self.avg = ((self.avg * self.count) + value) / (self.count + 1);
-        self.count += 1;
-    }
-    fn get(&self) -> u64 {
-        self.avg
+        let effective_window = self.reno.window().min(u16::MAX as usize) as u32;
+        (self.seq - self.last_received_ack).0 >= effective_window
     }
 }
 

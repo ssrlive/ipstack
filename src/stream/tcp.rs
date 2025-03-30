@@ -79,13 +79,14 @@ impl IpStackTcpStream {
     ) -> Result<IpStackTcpStream, IpStackError> {
         let (stream_sender, stream_receiver) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
         let deadline = tokio::time::Instant::now() + timeout_interval;
+        let mss = mtu as usize - 40; // assuming IP header 20 + TCP header 20
         let stream = IpStackTcpStream {
             src_addr,
             dst_addr,
             stream_sender,
             stream_receiver,
             up_packet_sender,
-            tcb: Tcb::new(SeqNum(tcp.sequence_number) + 1),
+            tcb: Tcb::new(SeqNum(tcp.sequence_number) + 1, mss),
             mtu,
             shutdown: Shutdown::None,
             read_notify_for_shutdown: None,
@@ -133,7 +134,7 @@ impl IpStackTcpStream {
 
     fn calculate_payload_max_len(&self, ip_header_size: usize, tcp_header_size: usize) -> usize {
         std::cmp::min(
-            self.tcb.get_send_window() as usize,
+            self.tcb.get_effective_send_window() as usize,
             (self.mtu as usize).saturating_sub(ip_header_size + tcp_header_size),
         )
     }
@@ -214,6 +215,7 @@ impl AsyncRead for IpStackTcpStream {
             if matches!(Pin::new(&mut self.timeout).poll(cx), Poll::Ready(_)) {
                 if !final_reset {
                     log::warn!("timeout reached for {network_tuple}");
+                    // self.tcb.on_retransmit(); // timeout trigger retransmit
                 }
                 let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
                 let packet = self.create_rev_packet(RST | ACK, TTL, seq, ack, window_size, Vec::new())?;
@@ -312,7 +314,7 @@ impl AsyncRead for IpStackTcpStream {
                                     continue;
                                 }
                                 PacketStatus::RetransmissionRequest => {
-                                    self.tcb.update_send_window(window_size);
+                                    self.tcb.on_duplicate_ack(); // deal with duplicate ACK
                                     if let Some(packet) = self.tcb.find_inflight_packet(incoming_ack) {
                                         let (s, a, w) = (packet.seq.0, self.tcb.get_ack().0, self.tcb.get_recv_window());
                                         let rev_packet = self.create_rev_packet(ACK | PSH, TTL, s, a, w, packet.payload.clone())?;
@@ -353,7 +355,7 @@ impl AsyncRead for IpStackTcpStream {
                                     continue;
                                 }
                                 PacketStatus::Invalid => continue,
-                            };
+                            }
                         }
                         if flags == (ACK | FIN) {
                             // The other side is closing the connection, we need to send an ACK and change state to CloseWait
@@ -382,6 +384,7 @@ impl AsyncRead for IpStackTcpStream {
                             self.tcb.change_state(TcpState::Closed);
                         }
                     } else if self.tcb.get_state() == TcpState::FinWait1 {
+                        log::debug!("{ts:?}: {network_tuple} {l_info} {info}, {pkt_type:?} len = {len}");
                         if flags & (ACK | FIN) == (ACK | FIN) && len == 0 {
                             // If the received packet is an ACK with FIN, we need to send an ACK and change state to TimeWait directly, not to FinWait2
                             self.tcb.increase_ack();
@@ -408,6 +411,7 @@ impl AsyncRead for IpStackTcpStream {
                             continue;
                         }
                     } else if self.tcb.get_state() == TcpState::FinWait2 {
+                        log::debug!("{ts:?}: {network_tuple} {l_info} {info}, {pkt_type:?} len = {len}");
                         if flags & (ACK | FIN) == (ACK | FIN) && len == 0 {
                             self.tcb.increase_ack();
                             let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
@@ -458,7 +462,7 @@ impl AsyncWrite for IpStackTcpStream {
         }
         self.reset_timeout(false);
 
-        if (self.tcb.get_send_window() as u64) < self.tcb.get_avg_send_window() / 2 || self.tcb.is_send_buffer_full() {
+        if self.tcb.is_send_buffer_full() {
             self.write_notify = Some(cx.waker().clone());
             return Poll::Pending;
         }
@@ -483,6 +487,9 @@ impl AsyncWrite for IpStackTcpStream {
     fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let (nt, ts, sd) = (self.network_tuple(), self.tcb.get_state(), &self.shutdown);
         log::trace!("poll_shutdown {nt}, TCP state {ts:?}, shutdown status {sd}");
+        if matches!(self.shutdown, Shutdown::Ready | Shutdown::None) {
+            log::debug!("poll_shutdown {nt}, TCP state {ts:?}, shutdown status {sd}");
+        }
         match self.shutdown {
             Shutdown::None => {
                 self.shutdown.pending(cx.waker().clone());
