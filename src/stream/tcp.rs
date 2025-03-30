@@ -100,7 +100,7 @@ impl IpStackTcpStream {
         }
         if !tcp.rst {
             let (seq, ack, window_size) = (stream.tcb.get_seq().0, stream.tcb.get_ack().0, stream.tcb.get_recv_window());
-            let pkt = stream.create_rev_packet(RST | ACK, TTL, seq, ack, window_size, Vec::new())?;
+            let pkt = stream.create_rev_packet(ACK | RST, TTL, seq, ack, window_size, Vec::new())?;
             if let Err(err) = stream.up_packet_sender.send(pkt) {
                 log::warn!("Error sending RST/ACK packet: {:?}", err);
             }
@@ -218,7 +218,7 @@ impl AsyncRead for IpStackTcpStream {
                     // self.tcb.on_retransmit(); // timeout trigger retransmit
                 }
                 let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
-                let packet = self.create_rev_packet(RST | ACK, TTL, seq, ack, window_size, Vec::new())?;
+                let packet = self.create_rev_packet(ACK | RST, TTL, seq, ack, window_size, Vec::new())?;
                 self.up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
                 self.tcb.change_state(TcpState::Closed);
                 self.shutdown.ready();
@@ -228,7 +228,7 @@ impl AsyncRead for IpStackTcpStream {
 
             if self.tcb.get_state() == TcpState::Listen {
                 let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
-                let packet = self.create_rev_packet(SYN | ACK, TTL, seq, ack, window_size, Vec::new())?;
+                let packet = self.create_rev_packet(ACK | SYN, TTL, seq, ack, window_size, Vec::new())?;
                 self.up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
                 self.tcb.increase_seq();
                 self.tcb.change_state(TcpState::SynReceived);
@@ -280,6 +280,9 @@ impl AsyncRead for IpStackTcpStream {
                         self.shutdown.ready();
                         return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset)));
                     }
+
+                    self.tcb.update_duplicate_ack_count(incoming_ack);
+
                     let pkt_type = self.tcb.check_pkt_type(tcp_header, payload);
                     if pkt_type == PacketStatus::Invalid {
                         continue;
@@ -290,12 +293,14 @@ impl AsyncRead for IpStackTcpStream {
                     log::trace!("{ts:?}: {network_tuple} {l_info} {info}, {pkt_type:?} len = {len}");
 
                     if self.tcb.get_state() == TcpState::SynReceived {
-                        if flags == ACK {
-                            assert_eq!(incoming_ack, self.tcb.get_seq());
-                            assert_eq!(incoming_seq, self.tcb.get_ack());
-                            self.tcb.update_last_received_ack(incoming_ack);
-                            self.tcb.update_send_window(window_size);
-                            self.tcb.change_state(TcpState::Established);
+                        match pkt_type {
+                            PacketStatus::Ack => {
+                                self.tcb.update_last_received_ack(incoming_ack);
+                                self.tcb.update_send_window(window_size);
+                                self.tcb.change_state(TcpState::Established);
+                                continue;
+                            }
+                            _ => return Poll::Ready(Err(Error::new(InvalidData, format!("Invalid TCP packet: {network_tuple} {info}")))),
                         }
                     } else if self.tcb.get_state() == TcpState::Established {
                         if flags == ACK {
@@ -354,7 +359,17 @@ impl AsyncRead for IpStackTcpStream {
                                     self.write_notify.take().map(|w| w.wake_by_ref()).unwrap_or(());
                                     continue;
                                 }
-                                PacketStatus::Invalid => continue,
+                                PacketStatus::OutOfOrder => {
+                                    self.tcb.add_unordered_packet(incoming_seq, payload.clone());
+                                    let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
+                                    let packet = self.create_rev_packet(ACK, TTL, seq, ack, window_size, Vec::new())?;
+                                    self.up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
+                                }
+                                PacketStatus::DuplicateAck => {
+                                    self.tcb.update_send_window(window_size);
+                                    self.write_notify.take().map(|w| w.wake_by_ref()).unwrap_or(());
+                                }
+                                _ => continue,
                             }
                         }
                         if flags == (ACK | FIN) {
@@ -426,7 +441,7 @@ impl AsyncRead for IpStackTcpStream {
                             self.tcb.update_send_window(window_size);
                             let l_ack = self.tcb.get_ack();
                             if incoming_seq < l_ack {
-                                log::debug!("Ignoring duplicate ACK in FinWait2: seq {incoming_seq}, expected {l_ack}");
+                                log::debug!("{ts:?}: Ignoring duplicate ACK, {network_tuple} seq {incoming_seq}, expected {l_ack}");
                             }
                             continue;
                         }
@@ -442,6 +457,7 @@ impl AsyncRead for IpStackTcpStream {
                             continue;
                         }
                     } else if self.tcb.get_state() == TcpState::TimeWait && flags & (ACK | FIN) == (ACK | FIN) {
+                        log::debug!("{ts:?}: {network_tuple} {l_info} {info}, {pkt_type:?} len = {len}");
                         let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
                         let packet = self.create_rev_packet(ACK, TTL, seq, ack, window_size, Vec::new())?;
                         // wait to timeout, can't change state here

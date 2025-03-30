@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, VecDeque};
 // const MAX_UNACK: u32 = 1024 * 16; // 16KB
 const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
 
+const MAX_COUNT_FOR_DUP_ACK: usize = 3; // Maximum number of duplicate ACKs before retransmission
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum TcpState {
     // Init, /* Since we always act as a server, it starts from `Listen`, so we don't use states Init & SynSent. */
@@ -28,6 +30,9 @@ pub(super) enum PacketStatus {
     NewPacket,
     Ack,
     KeepAlive,
+    Fin,
+    DuplicateAck,
+    OutOfOrder,
 }
 
 #[derive(Debug)]
@@ -35,10 +40,27 @@ pub(super) struct Tcb {
     seq: SeqNum,
     ack: SeqNum,
     last_received_ack: SeqNum,
+    duplicate_ack_count: usize,
     state: TcpState,
     reno: Reno,
     inflight_packets: VecDeque<InflightPacket>,
     unordered_packets: BTreeMap<SeqNum, UnorderedPacket>,
+}
+
+impl Tcb {
+    pub fn update_duplicate_ack_count(&mut self, rcvd_ack: SeqNum) {
+        // If the received rcvd_ack is the same as self.last_received_ack and not all data has been acknowledged (rcvd_ack < self.seq), increment the count.
+        if rcvd_ack == self.last_received_ack && rcvd_ack < self.seq {
+            self.duplicate_ack_count = self.duplicate_ack_count.saturating_add(1);
+        } else {
+            // self.last_received_ack = rcvd_ack;
+            self.duplicate_ack_count = 0; // reset duplicate ACK count
+        }
+    }
+
+    pub fn get_duplicate_ack_count(&self) -> usize {
+        self.duplicate_ack_count
+    }
 }
 
 impl Tcb {
@@ -51,6 +73,7 @@ impl Tcb {
             seq: seq.into(),
             ack,
             last_received_ack: seq.into(),
+            duplicate_ack_count: 0,
             state: TcpState::Listen,
             reno: Reno::new(mss),
             inflight_packets: VecDeque::new(),
@@ -111,6 +134,7 @@ impl Tcb {
         self.reno.on_duplicate_ack();
     }
 
+    // call on_retransmit when TCP packet transmission timeout
     #[allow(dead_code)]
     pub(crate) fn on_retransmit(&mut self) {
         self.reno.on_retransmit();
@@ -135,34 +159,158 @@ impl Tcb {
         let rcvd_ack = SeqNum(tcp_header.acknowledgment_number);
         let rcvd_seq = SeqNum(tcp_header.sequence_number);
         let rcvd_window = tcp_header.window_size;
+        let has_fin = tcp_header.fin;
+        let has_ack = tcp_header.ack;
+
         let cwnd = self.reno.window() as u16;
-        let res = if rcvd_ack > self.seq {
+        let last_received_ack = self.last_received_ack;
+        let local_seq = self.seq;
+        let local_ack = self.ack;
+        let duplicate_ack_count = self.get_duplicate_ack_count();
+
+        let res = if rcvd_ack > local_seq {
             PacketStatus::Invalid
         } else {
-            match rcvd_ack.cmp(&self.last_received_ack) {
-                std::cmp::Ordering::Less => PacketStatus::Invalid,
-                std::cmp::Ordering::Equal => {
-                    if !payload.is_empty() {
-                        PacketStatus::NewPacket
-                    } else if cwnd == rcvd_window && self.seq != self.last_received_ack {
-                        PacketStatus::RetransmissionRequest
-                    } else if self.ack - 1 == rcvd_seq {
-                        PacketStatus::KeepAlive
+            match self.state {
+                TcpState::Listen => PacketStatus::Invalid,
+                TcpState::SynReceived => {
+                    if has_ack && rcvd_ack == local_seq && rcvd_seq == local_ack && payload.is_empty() {
+                        PacketStatus::Ack // expecting a SYN-ACK packet, ensure handshake is complete
                     } else {
-                        PacketStatus::WindowUpdate
+                        PacketStatus::Invalid
                     }
                 }
-                std::cmp::Ordering::Greater => {
-                    if !payload.is_empty() {
-                        PacketStatus::NewPacket
+                TcpState::Established => {
+                    match rcvd_ack.cmp(&last_received_ack) {
+                        std::cmp::Ordering::Less => PacketStatus::Invalid, // stale ACK
+                        std::cmp::Ordering::Equal => {
+                            if !payload.is_empty() {
+                                match rcvd_seq.cmp(&local_ack) {
+                                    std::cmp::Ordering::Less => PacketStatus::Invalid,       // duplicate data
+                                    std::cmp::Ordering::Equal => PacketStatus::NewPacket,    // new data
+                                    std::cmp::Ordering::Greater => PacketStatus::OutOfOrder, // unordered data
+                                }
+                            } else if rcvd_window != cwnd {
+                                PacketStatus::WindowUpdate
+                            } else if rcvd_seq == local_ack - 1 {
+                                PacketStatus::KeepAlive // Keepalive Detection
+                            } else if local_seq != last_received_ack && duplicate_ack_count >= MAX_COUNT_FOR_DUP_ACK {
+                                PacketStatus::RetransmissionRequest
+                            } else {
+                                PacketStatus::DuplicateAck // Duplicate ACK
+                            }
+                        }
+                        std::cmp::Ordering::Greater => {
+                            if !payload.is_empty() {
+                                match rcvd_seq.cmp(&local_ack) {
+                                    std::cmp::Ordering::Less => PacketStatus::Invalid,
+                                    std::cmp::Ordering::Equal => PacketStatus::NewPacket,
+                                    std::cmp::Ordering::Greater => PacketStatus::OutOfOrder,
+                                }
+                            } else {
+                                PacketStatus::Ack
+                            }
+                        }
+                    }
+                }
+                TcpState::FinWait1 => {
+                    match rcvd_ack.cmp(&last_received_ack) {
+                        std::cmp::Ordering::Less => PacketStatus::Invalid,
+                        std::cmp::Ordering::Equal => {
+                            if has_fin && has_ack && payload.is_empty() {
+                                PacketStatus::Fin // The other side is closed
+                            } else if !payload.is_empty() {
+                                match rcvd_seq.cmp(&local_ack) {
+                                    std::cmp::Ordering::Less => PacketStatus::Invalid,
+                                    std::cmp::Ordering::Equal => PacketStatus::NewPacket,
+                                    std::cmp::Ordering::Greater => PacketStatus::OutOfOrder,
+                                }
+                            } else if rcvd_window != cwnd {
+                                PacketStatus::WindowUpdate
+                            } else {
+                                PacketStatus::DuplicateAck // Duplicate ACK, ignore
+                            }
+                        }
+                        std::cmp::Ordering::Greater => {
+                            if has_fin && has_ack && payload.is_empty() {
+                                PacketStatus::Fin
+                            } else if !payload.is_empty() {
+                                match rcvd_seq.cmp(&local_ack) {
+                                    std::cmp::Ordering::Less => PacketStatus::Invalid,
+                                    std::cmp::Ordering::Equal => PacketStatus::NewPacket,
+                                    std::cmp::Ordering::Greater => PacketStatus::OutOfOrder,
+                                }
+                            } else {
+                                PacketStatus::Ack // Confirm our FIN
+                            }
+                        }
+                    }
+                }
+                TcpState::FinWait2 => {
+                    match rcvd_ack.cmp(&last_received_ack) {
+                        std::cmp::Ordering::Less => PacketStatus::Invalid,
+                        std::cmp::Ordering::Equal => {
+                            if has_fin && has_ack && payload.is_empty() {
+                                PacketStatus::Fin // The other side is closed
+                            } else if !payload.is_empty() {
+                                match rcvd_seq.cmp(&local_ack) {
+                                    std::cmp::Ordering::Less => PacketStatus::Invalid,
+                                    std::cmp::Ordering::Equal => PacketStatus::NewPacket,
+                                    std::cmp::Ordering::Greater => PacketStatus::OutOfOrder,
+                                }
+                            } else if rcvd_window != cwnd {
+                                PacketStatus::WindowUpdate
+                            } else {
+                                PacketStatus::DuplicateAck // Duplicate ACK, ignore
+                            }
+                        }
+                        std::cmp::Ordering::Greater => {
+                            if has_fin && has_ack && payload.is_empty() {
+                                PacketStatus::Fin
+                            } else if !payload.is_empty() {
+                                match rcvd_seq.cmp(&local_ack) {
+                                    std::cmp::Ordering::Less => PacketStatus::Invalid,
+                                    std::cmp::Ordering::Equal => PacketStatus::NewPacket,
+                                    std::cmp::Ordering::Greater => PacketStatus::OutOfOrder,
+                                }
+                            } else {
+                                PacketStatus::Ack // Confirm our FIN
+                            }
+                        }
+                    }
+                }
+                TcpState::CloseWait => {
+                    if rcvd_ack <= last_received_ack {
+                        if rcvd_window != cwnd {
+                            PacketStatus::WindowUpdate
+                        } else {
+                            PacketStatus::DuplicateAck // Repeat ACK, waiting for us to send FIN
+                        }
+                    } else if !payload.is_empty() {
+                        PacketStatus::Invalid // Ignore new data because we have closed the connection
                     } else {
                         PacketStatus::Ack
                     }
                 }
+                TcpState::LastAck => {
+                    if has_ack && rcvd_ack > last_received_ack && payload.is_empty() {
+                        PacketStatus::Ack // Confirm our FIN
+                    } else {
+                        PacketStatus::Invalid
+                    }
+                }
+                TcpState::TimeWait => {
+                    if has_fin && has_ack && rcvd_ack == local_seq && rcvd_seq == local_ack - 1 {
+                        PacketStatus::Fin // Retransmitted FIN
+                    } else {
+                        PacketStatus::Invalid
+                    }
+                }
+                TcpState::Closed => PacketStatus::Invalid,
             }
         };
         #[rustfmt::skip]
-        log::trace!("recieved {{ ack = {rcvd_ack}, seq = {rcvd_seq}, window = {rcvd_window} }}, self {{ ack = {}, seq = {}, send_window = {cwnd} }}, {res:?}", self.ack, self.seq);
+        log::trace!("received {{ ack = {rcvd_ack}, seq = {rcvd_seq}, window = {rcvd_window} }}, self {{ ack = {local_ack}, seq = {local_seq}, send_window = {cwnd} }}, {res:?}");
         res
     }
 
@@ -176,32 +324,33 @@ impl Tcb {
     pub(super) fn update_last_received_ack(&mut self, ack: SeqNum) {
         self.last_received_ack = ack;
 
-        if self.state == TcpState::Established {
-            if let Some(index) = self.inflight_packets.iter().position(|p| p.contains_seq_num(ack - 1)) {
-                let Some(mut inflight_packet) = self.inflight_packets.remove(index) else {
-                    log::warn!("Failed to find inflight packet with seq = {}", ack - 1);
-                    return;
-                };
-                let distance = ack.distance(inflight_packet.seq) as usize;
-                if distance < inflight_packet.payload.len() {
-                    inflight_packet.payload.drain(0..distance);
-                    inflight_packet.seq = ack;
-                    self.inflight_packets.push_back(inflight_packet);
-                }
-                self.reno.on_ack(distance); // recived ACK, update Reno's cwnd
-            }
-            self.inflight_packets.retain(|p| {
-                let last_byte = p.seq + (p.payload.len() as u32);
-                last_byte > self.last_received_ack
-            });
+        if self.state != TcpState::Established {
+            return;
         }
+        self.update_inflight_packet_queue(ack);
+    }
+
+    pub(crate) fn update_inflight_packet_queue(&mut self, ack: SeqNum) {
+        if let Some(index) = self.inflight_packets.iter().position(|p| p.contains_seq_num(ack - 1)) {
+            let Some(mut inflight_packet) = self.inflight_packets.remove(index) else {
+                log::warn!("Failed to find inflight packet with seq = {}", ack - 1);
+                return;
+            };
+            let distance = ack.distance(inflight_packet.seq) as usize;
+            if distance < inflight_packet.payload.len() {
+                inflight_packet.payload.drain(0..distance);
+                inflight_packet.seq = ack;
+                self.inflight_packets.push_back(inflight_packet);
+            }
+            self.reno.on_ack(distance); // recived ACK, update Reno's cwnd
+        }
+        self.inflight_packets.retain(|p| ack < p.seq + (p.payload.len() as u32));
     }
 
     pub(crate) fn find_inflight_packet(&self, seq: SeqNum) -> Option<&InflightPacket> {
         self.inflight_packets.iter().find(|p| p.seq == seq)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn get_all_inflight_packets(&self) -> &VecDeque<InflightPacket> {
         &self.inflight_packets
     }

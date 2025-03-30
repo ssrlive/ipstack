@@ -47,6 +47,7 @@ impl Reno {
         self.ssthresh = (self.cwnd >> 1).max(self.min_cwnd);
     }
 
+    // call `on_retransmit` when TCP packet transmission timeout
     pub fn on_retransmit(&mut self) {
         self.cwnd = (self.cwnd >> 1).max(self.min_cwnd);
     }
