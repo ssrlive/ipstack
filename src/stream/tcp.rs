@@ -297,6 +297,9 @@ impl AsyncRead for IpStackTcpStream {
                             PacketStatus::Ack => {
                                 self.tcb.update_last_received_ack(incoming_ack);
                                 self.tcb.update_send_window(window_size);
+                                if len > 0 {
+                                    self.tcb.add_unordered_packet(incoming_seq, payload.clone());
+                                }
                                 self.tcb.change_state(TcpState::Established);
                                 continue;
                             }

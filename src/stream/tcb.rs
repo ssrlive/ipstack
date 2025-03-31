@@ -174,7 +174,7 @@ impl Tcb {
             match self.state {
                 TcpState::Listen => PacketStatus::Invalid,
                 TcpState::SynReceived => {
-                    if has_ack && rcvd_ack == local_seq && rcvd_seq == local_ack && payload.is_empty() {
+                    if has_ack && rcvd_ack == local_seq && rcvd_seq == local_ack {
                         PacketStatus::Ack // expecting a SYN-ACK packet, ensure handshake is complete
                     } else {
                         PacketStatus::Invalid
