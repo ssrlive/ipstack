@@ -44,7 +44,7 @@ pub(super) struct Tcb {
     state: TcpState,
     reno: Reno,
     inflight_packets: VecDeque<InflightPacket>,
-    unordered_packets: BTreeMap<SeqNum, UnorderedPacket>,
+    unordered_packets: BTreeMap<SeqNum, Vec<u8>>,
 }
 
 impl Tcb {
@@ -86,10 +86,10 @@ impl Tcb {
             log::warn!("Received packet seq < ack: seq = {}, ack = {}, len = {}", seq, self.ack, buf.len());
             return;
         }
-        self.unordered_packets.insert(seq, UnorderedPacket::new(buf));
+        self.unordered_packets.insert(seq, buf);
     }
     pub(super) fn get_available_read_buffer_size(&self) -> usize {
-        READ_BUFFER_SIZE.saturating_sub(self.unordered_packets.values().map(|p| p.payload.len()).sum())
+        READ_BUFFER_SIZE.saturating_sub(self.unordered_packets.values().map(|p| p.len()).sum())
     }
 
     pub(super) fn get_unordered_packets(&mut self) -> Option<Vec<u8>> {
@@ -97,9 +97,8 @@ impl Tcb {
         // for (seq,_) in self.unordered_packets.iter() {
         //     dbg!(seq);
         // }
-        self.unordered_packets.remove(&self.ack).map(|p| {
-            self.ack += p.payload.len() as u32;
-            p.payload
+        self.unordered_packets.remove(&self.ack).inspect(|p| {
+            self.ack += p.len() as u32;
         })
     }
 
@@ -392,19 +391,4 @@ fn test_in_flight_packet() {
     assert!(p.contains_seq_num(2.into()));
 
     assert!(!p.contains_seq_num(3.into()));
-}
-
-#[derive(Debug)]
-struct UnorderedPacket {
-    payload: Vec<u8>,
-    // pub recv_time: SystemTime, // todo
-}
-
-impl UnorderedPacket {
-    pub(crate) fn new(payload: Vec<u8>) -> Self {
-        Self {
-            payload,
-            // recv_time: SystemTime::now(), // todo
-        }
-    }
 }
