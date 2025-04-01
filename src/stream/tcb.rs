@@ -314,6 +314,9 @@ impl Tcb {
     }
 
     pub(super) fn add_inflight_packet(&mut self, buf: Vec<u8>) -> std::io::Result<()> {
+        if buf.is_empty() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Empty payload"));
+        }
         let buf_len = buf.len() as u32;
         self.inflight_packets.push_back(InflightPacket::new(self.seq, buf));
         self.seq += buf_len;
