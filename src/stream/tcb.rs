@@ -93,13 +93,7 @@ impl Tcb {
     }
 
     pub(super) fn get_unordered_packets(&mut self) -> Option<Vec<u8>> {
-        // dbg!(self.ack);
-        // for (seq,_) in self.unordered_packets.iter() {
-        //     dbg!(seq);
-        // }
-        self.unordered_packets.remove(&self.ack).inspect(|p| {
-            self.ack += p.len() as u32;
-        })
+        self.unordered_packets.remove(&self.ack).inspect(|p| self.ack += p.len() as u32)
     }
 
     pub(super) fn increase_seq(&mut self) {

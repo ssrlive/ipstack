@@ -199,6 +199,8 @@ impl IpStackTcpStream {
     }
 }
 
+static SESSION_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 impl AsyncRead for IpStackTcpStream {
     fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         // Always store the newest waker for read-notifier in shutdown state
@@ -228,7 +230,10 @@ impl AsyncRead for IpStackTcpStream {
             self.reset_timeout(final_reset);
 
             if state == TcpState::Listen {
+                let sessions = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
+                let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
+                log::trace!("{network_tuple} {state:?}: {l_info} session begins, total sessions: {sessions}");
                 let packet = self.create_rev_packet(ACK | SYN, TTL, seq, ack, window_size, Vec::new())?;
                 self.up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
                 self.tcb.increase_seq();
@@ -239,7 +244,7 @@ impl AsyncRead for IpStackTcpStream {
             if let Some(data) = self.tcb.get_unordered_packets() {
                 if state != TcpState::Established {
                     let l_info = format!("local {{ seq: {}, ack: {} }}", self.tcb.get_seq(), self.tcb.get_ack());
-                    log::debug!("{network_tuple} {state:?}: {l_info} still receiving data, len = {}", data.len());
+                    log::trace!("{network_tuple} {state:?}: {l_info} still receiving data, len = {}", data.len());
                 }
                 buf.put_slice(&data);
                 let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
@@ -260,7 +265,7 @@ impl AsyncRead for IpStackTcpStream {
                 && state == TcpState::Established
                 && self.tcb.get_last_received_ack() == self.tcb.get_seq()
             {
-                log::debug!("{network_tuple} {state:?}: Shutting down, actively send a farewell packet to the other side");
+                log::trace!("{network_tuple} {state:?}: Shutting down, actively send a farewell packet to the other side");
                 let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
                 let packet = self.create_rev_packet(ACK | FIN, TTL, seq, ack, window_size, Vec::new())?;
                 self.tcb.increase_seq();
@@ -407,7 +412,7 @@ impl AsyncRead for IpStackTcpStream {
                             self.tcb.change_state(TcpState::Closed);
                         }
                     } else if self.tcb.get_state() == TcpState::FinWait1 {
-                        log::debug!("{network_tuple} {state:?}: {l_info} {info}, {pkt_type:?} len = {len}");
+                        log::trace!("{network_tuple} {state:?}: {l_info} {info}, {pkt_type:?} len = {len}");
                         if flags & (ACK | FIN) == (ACK | FIN) && len == 0 {
                             // If the received packet is an ACK with FIN, we need to send an ACK and change state to TimeWait directly, not to FinWait2
                             self.tcb.increase_ack();
@@ -434,7 +439,7 @@ impl AsyncRead for IpStackTcpStream {
                             continue;
                         }
                     } else if self.tcb.get_state() == TcpState::FinWait2 {
-                        log::debug!("{network_tuple} {state:?}: {l_info} {info}, {pkt_type:?} len = {len}");
+                        log::trace!("{network_tuple} {state:?}: {l_info} {info}, {pkt_type:?} len = {len}");
                         if flags & (ACK | FIN) == (ACK | FIN) && len == 0 {
                             self.tcb.increase_ack();
                             let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
@@ -449,7 +454,7 @@ impl AsyncRead for IpStackTcpStream {
                             self.tcb.update_send_window(window_size);
                             let l_ack = self.tcb.get_ack();
                             if incoming_seq < l_ack {
-                                log::debug!("{network_tuple} {state:?}: Ignoring duplicate ACK, seq {incoming_seq}, expected {l_ack}");
+                                log::trace!("{network_tuple} {state:?}: Ignoring duplicate ACK, seq {incoming_seq}, expected {l_ack}");
                             }
                             continue;
                         }
@@ -465,7 +470,7 @@ impl AsyncRead for IpStackTcpStream {
                             continue;
                         }
                     } else if self.tcb.get_state() == TcpState::TimeWait && flags & (ACK | FIN) == (ACK | FIN) {
-                        log::debug!("{network_tuple} {state:?}: {l_info} {info}, {pkt_type:?} len = {len}");
+                        log::trace!("{network_tuple} {state:?}: {l_info} {info}, {pkt_type:?} len = {len}");
                         let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
                         let packet = self.create_rev_packet(ACK, TTL, seq, ack, window_size, Vec::new())?;
                         // wait to timeout, can't change state here
@@ -492,7 +497,7 @@ impl AsyncWrite for IpStackTcpStream {
         }
 
         let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
-        let pkt = self.create_rev_packet(ACK | PSH, TTL, seq, ack, window_size, buf.to_vec())?;
+        let pkt = self.create_rev_packet(ACK, TTL, seq, ack, window_size, buf.to_vec())?;
         let payload_len = pkt.payload.len();
         use std::io::{Error, ErrorKind::UnexpectedEof};
         self.up_packet_sender.send(pkt.clone()).map_err(|e| Error::new(UnexpectedEof, e))?;
@@ -509,12 +514,7 @@ impl AsyncWrite for IpStackTcpStream {
     }
 
     fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let (nt, state, sd) = (self.network_tuple(), self.tcb.get_state(), &self.shutdown);
-        if matches!(self.shutdown, Shutdown::None | Shutdown::Ready) {
-            log::debug!("{nt} {state:?}: poll_shutdown status {sd}");
-        } else {
-            log::trace!("{nt} {state:?}: poll_shutdown status {sd}");
-        }
+        let (nt, state) = (self.network_tuple(), self.tcb.get_state());
         match self.shutdown {
             Shutdown::None => {
                 self.shutdown.pending(cx.waker().clone());
@@ -525,7 +525,11 @@ impl AsyncWrite for IpStackTcpStream {
                 self.read_notify_for_shutdown.take().map(|w| w.wake_by_ref()).unwrap_or(());
                 Poll::Pending
             }
-            Shutdown::Ready => Poll::Ready(Ok(())),
+            Shutdown::Ready => {
+                let sessions = SESSION_COUNTER.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) - 1;
+                log::trace!("{nt} {state:?}: session closed, total sessions: {sessions}");
+                Poll::Ready(Ok(()))
+            }
         }
     }
 }
