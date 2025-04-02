@@ -412,7 +412,6 @@ impl AsyncRead for IpStackTcpStream {
                             self.tcb.change_state(TcpState::Closed);
                         }
                     } else if self.tcb.get_state() == TcpState::FinWait1 {
-                        log::trace!("{network_tuple} {state:?}: {l_info} {info}, {pkt_type:?} len = {len}");
                         if flags & (ACK | FIN) == (ACK | FIN) && len == 0 {
                             // If the received packet is an ACK with FIN, we need to send an ACK and change state to TimeWait directly, not to FinWait2
                             self.tcb.increase_ack();
@@ -439,7 +438,6 @@ impl AsyncRead for IpStackTcpStream {
                             continue;
                         }
                     } else if self.tcb.get_state() == TcpState::FinWait2 {
-                        log::trace!("{network_tuple} {state:?}: {l_info} {info}, {pkt_type:?} len = {len}");
                         if flags & (ACK | FIN) == (ACK | FIN) && len == 0 {
                             self.tcb.increase_ack();
                             let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
@@ -470,7 +468,6 @@ impl AsyncRead for IpStackTcpStream {
                             continue;
                         }
                     } else if self.tcb.get_state() == TcpState::TimeWait && flags & (ACK | FIN) == (ACK | FIN) {
-                        log::trace!("{network_tuple} {state:?}: {l_info} {info}, {pkt_type:?} len = {len}");
                         let (seq, ack, window_size) = (self.tcb.get_seq().0, self.tcb.get_ack().0, self.tcb.get_recv_window());
                         let packet = self.create_rev_packet(ACK, TTL, seq, ack, window_size, Vec::new())?;
                         // wait to timeout, can't change state here
@@ -502,6 +499,10 @@ impl AsyncWrite for IpStackTcpStream {
         use std::io::{Error, ErrorKind::UnexpectedEof};
         self.up_packet_sender.send(pkt.clone()).map_err(|e| Error::new(UnexpectedEof, e))?;
         self.tcb.add_inflight_packet(pkt.payload)?;
+
+        let (nt, state, len) = (self.network_tuple(), self.tcb.get_state(), buf.len());
+        let l_info = format!("local {{ seq: {}, ack: {} }}", self.tcb.get_seq(), self.tcb.get_ack());
+        log::trace!("{nt} {state:?}: {l_info} upstream data written to TNU, len = {len}");
 
         Poll::Ready(Ok(payload_len))
     }
