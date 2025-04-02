@@ -23,7 +23,7 @@ pub(crate) enum TcpState {
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
-pub(super) enum PacketStatus {
+pub(super) enum PacketType {
     WindowUpdate,
     Invalid,
     RetransmissionRequest,
@@ -148,7 +148,7 @@ impl Tcb {
     //     }
     // }
 
-    pub(super) fn check_pkt_type(&self, tcp_header: &TcpHeader, payload: &[u8]) -> PacketStatus {
+    pub(super) fn check_pkt_type(&self, tcp_header: &TcpHeader, payload: &[u8]) -> PacketType {
         let rcvd_ack = SeqNum(tcp_header.acknowledgment_number);
         let rcvd_seq = SeqNum(tcp_header.sequence_number);
         let rcvd_window = tcp_header.window_size;
@@ -162,112 +162,112 @@ impl Tcb {
         let duplicate_ack_count = self.get_duplicate_ack_count();
 
         let res = if rcvd_ack > local_seq {
-            PacketStatus::Invalid
+            PacketType::Invalid
         } else {
             match self.state {
-                TcpState::Listen => PacketStatus::Invalid,
+                TcpState::Listen => PacketType::Invalid,
                 TcpState::SynReceived => {
                     if has_ack && rcvd_ack == local_seq && rcvd_seq == local_ack {
-                        PacketStatus::Ack // expecting a SYN-ACK packet, ensure handshake is complete
+                        PacketType::Ack // expecting a SYN-ACK packet, ensure handshake is complete
                     } else {
-                        PacketStatus::Invalid
+                        PacketType::Invalid
                     }
                 }
                 TcpState::Established => {
                     match rcvd_ack.cmp(&last_received_ack) {
-                        std::cmp::Ordering::Less => PacketStatus::Invalid, // stale ACK
+                        std::cmp::Ordering::Less => PacketType::Invalid, // stale ACK
                         std::cmp::Ordering::Equal => {
                             if !payload.is_empty() {
                                 match rcvd_seq.cmp(&local_ack) {
-                                    std::cmp::Ordering::Less => PacketStatus::Invalid,       // duplicate data
-                                    std::cmp::Ordering::Equal => PacketStatus::NewPacket,    // new data
-                                    std::cmp::Ordering::Greater => PacketStatus::OutOfOrder, // unordered data
+                                    std::cmp::Ordering::Less => PacketType::Invalid,       // duplicate data
+                                    std::cmp::Ordering::Equal => PacketType::NewPacket,    // new data
+                                    std::cmp::Ordering::Greater => PacketType::OutOfOrder, // unordered data
                                 }
                             } else if rcvd_window != cwnd {
-                                PacketStatus::WindowUpdate
+                                PacketType::WindowUpdate
                             } else if rcvd_seq == local_ack - 1 {
-                                PacketStatus::KeepAlive // Keepalive Detection
+                                PacketType::KeepAlive // Keepalive Detection
                             } else if local_seq != last_received_ack && duplicate_ack_count >= MAX_COUNT_FOR_DUP_ACK {
-                                PacketStatus::RetransmissionRequest
+                                PacketType::RetransmissionRequest
                             } else {
-                                PacketStatus::DuplicateAck // Duplicate ACK
+                                PacketType::DuplicateAck // Duplicate ACK
                             }
                         }
                         std::cmp::Ordering::Greater => {
                             if !payload.is_empty() {
                                 match rcvd_seq.cmp(&local_ack) {
-                                    std::cmp::Ordering::Less => PacketStatus::Invalid,
-                                    std::cmp::Ordering::Equal => PacketStatus::NewPacket,
-                                    std::cmp::Ordering::Greater => PacketStatus::OutOfOrder,
+                                    std::cmp::Ordering::Less => PacketType::Invalid,
+                                    std::cmp::Ordering::Equal => PacketType::NewPacket,
+                                    std::cmp::Ordering::Greater => PacketType::OutOfOrder,
                                 }
                             } else {
-                                PacketStatus::Ack
+                                PacketType::Ack
                             }
                         }
                     }
                 }
                 TcpState::FinWait1 => {
                     match rcvd_ack.cmp(&last_received_ack) {
-                        std::cmp::Ordering::Less => PacketStatus::Invalid,
+                        std::cmp::Ordering::Less => PacketType::Invalid,
                         std::cmp::Ordering::Equal => {
                             if has_fin && has_ack && payload.is_empty() {
-                                PacketStatus::Fin // The other side is closed
+                                PacketType::Fin // The other side is closed
                             } else if !payload.is_empty() {
                                 match rcvd_seq.cmp(&local_ack) {
-                                    std::cmp::Ordering::Less => PacketStatus::Invalid,
-                                    std::cmp::Ordering::Equal => PacketStatus::NewPacket,
-                                    std::cmp::Ordering::Greater => PacketStatus::OutOfOrder,
+                                    std::cmp::Ordering::Less => PacketType::Invalid,
+                                    std::cmp::Ordering::Equal => PacketType::NewPacket,
+                                    std::cmp::Ordering::Greater => PacketType::OutOfOrder,
                                 }
                             } else if rcvd_window != cwnd {
-                                PacketStatus::WindowUpdate
+                                PacketType::WindowUpdate
                             } else {
-                                PacketStatus::DuplicateAck // Duplicate ACK, ignore
+                                PacketType::DuplicateAck // Duplicate ACK, ignore
                             }
                         }
                         std::cmp::Ordering::Greater => {
                             if has_fin && has_ack && payload.is_empty() {
-                                PacketStatus::Fin
+                                PacketType::Fin
                             } else if !payload.is_empty() {
                                 match rcvd_seq.cmp(&local_ack) {
-                                    std::cmp::Ordering::Less => PacketStatus::Invalid,
-                                    std::cmp::Ordering::Equal => PacketStatus::NewPacket,
-                                    std::cmp::Ordering::Greater => PacketStatus::OutOfOrder,
+                                    std::cmp::Ordering::Less => PacketType::Invalid,
+                                    std::cmp::Ordering::Equal => PacketType::NewPacket,
+                                    std::cmp::Ordering::Greater => PacketType::OutOfOrder,
                                 }
                             } else {
-                                PacketStatus::Ack // Confirm our FIN
+                                PacketType::Ack // Confirm our FIN
                             }
                         }
                     }
                 }
                 TcpState::FinWait2 => {
                     match rcvd_ack.cmp(&last_received_ack) {
-                        std::cmp::Ordering::Less => PacketStatus::Invalid,
+                        std::cmp::Ordering::Less => PacketType::Invalid,
                         std::cmp::Ordering::Equal => {
                             if has_fin && has_ack && payload.is_empty() {
-                                PacketStatus::Fin // The other side is closed
+                                PacketType::Fin // The other side is closed
                             } else if !payload.is_empty() {
                                 match rcvd_seq.cmp(&local_ack) {
-                                    std::cmp::Ordering::Less => PacketStatus::Invalid,
-                                    std::cmp::Ordering::Equal => PacketStatus::NewPacket,
-                                    std::cmp::Ordering::Greater => PacketStatus::OutOfOrder,
+                                    std::cmp::Ordering::Less => PacketType::Invalid,
+                                    std::cmp::Ordering::Equal => PacketType::NewPacket,
+                                    std::cmp::Ordering::Greater => PacketType::OutOfOrder,
                                 }
                             } else if rcvd_window != cwnd {
-                                PacketStatus::WindowUpdate
+                                PacketType::WindowUpdate
                             } else {
-                                PacketStatus::DuplicateAck // Duplicate ACK, ignore
+                                PacketType::DuplicateAck // Duplicate ACK, ignore
                             }
                         }
                         std::cmp::Ordering::Greater => {
                             if has_fin && has_ack && payload.is_empty() {
-                                PacketStatus::Fin
+                                PacketType::Fin
                             } else if !payload.is_empty() {
                                 match rcvd_seq.cmp(&local_ack) {
-                                    std::cmp::Ordering::Less => PacketStatus::Invalid,
-                                    std::cmp::Ordering::Equal => PacketStatus::NewPacket,
-                                    std::cmp::Ordering::Greater => PacketStatus::OutOfOrder,
+                                    std::cmp::Ordering::Less => PacketType::Invalid,
+                                    std::cmp::Ordering::Equal => PacketType::NewPacket,
+                                    std::cmp::Ordering::Greater => PacketType::OutOfOrder,
                                 }
                             } else {
-                                PacketStatus::Ack // Confirm our FIN
+                                PacketType::Ack // Confirm our FIN
                             }
                         }
                     }
@@ -275,31 +275,31 @@ impl Tcb {
                 TcpState::CloseWait => {
                     if rcvd_ack <= last_received_ack {
                         if rcvd_window != cwnd {
-                            PacketStatus::WindowUpdate
+                            PacketType::WindowUpdate
                         } else {
-                            PacketStatus::DuplicateAck // Repeat ACK, waiting for us to send FIN
+                            PacketType::DuplicateAck // Repeat ACK, waiting for us to send FIN
                         }
                     } else if !payload.is_empty() {
-                        PacketStatus::Invalid // Ignore new data because we have closed the connection
+                        PacketType::Invalid // Ignore new data because we have closed the connection
                     } else {
-                        PacketStatus::Ack
+                        PacketType::Ack
                     }
                 }
                 TcpState::LastAck => {
                     if has_ack && rcvd_ack > last_received_ack && payload.is_empty() {
-                        PacketStatus::Ack // Confirm our FIN
+                        PacketType::Ack // Confirm our FIN
                     } else {
-                        PacketStatus::Invalid
+                        PacketType::Invalid
                     }
                 }
                 TcpState::TimeWait => {
                     if has_fin && has_ack && rcvd_ack == local_seq && rcvd_seq == local_ack - 1 {
-                        PacketStatus::Fin // Retransmitted FIN
+                        PacketType::Fin // Retransmitted FIN
                     } else {
-                        PacketStatus::Invalid
+                        PacketType::Invalid
                     }
                 }
-                TcpState::Closed => PacketStatus::Invalid,
+                TcpState::Closed => PacketType::Invalid,
             }
         };
         #[rustfmt::skip]
