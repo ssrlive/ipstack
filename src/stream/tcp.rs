@@ -256,7 +256,7 @@ impl AsyncRead for IpStackTcpStream {
                 continue;
             }
 
-            if let Some(data) = self.tcb.get_unordered_packets() {
+            if let Some(data) = self.tcb.get_unordered_packets(buf.remaining()) {
                 if state != TcpState::Established {
                     let l_info = format!("local {{ seq: {}, ack: {} }}", self.tcb.get_seq(), self.tcb.get_ack());
                     log::trace!("{network_tuple} {state:?}: {l_info} still receiving data, len = {}", data.len());

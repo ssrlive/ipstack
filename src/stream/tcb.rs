@@ -92,8 +92,45 @@ impl Tcb {
         READ_BUFFER_SIZE.saturating_sub(self.unordered_packets.values().map(|p| p.len()).sum())
     }
 
-    pub(super) fn get_unordered_packets(&mut self) -> Option<Vec<u8>> {
-        self.unordered_packets.remove(&self.ack).inspect(|p| self.ack += p.len() as u32)
+    pub(super) fn get_unordered_packets(&mut self, max_bytes: usize) -> Option<Vec<u8>> {
+        // self.unordered_packets.remove(&self.ack).inspect(|p| self.ack += p.len() as u32)
+
+        let mut data = Vec::new();
+        let mut remaining_bytes = max_bytes;
+
+        while remaining_bytes > 0 {
+            if let Some(seq) = self.unordered_packets.keys().next().copied() {
+                if seq != self.ack {
+                    break; // sequence number is not continuous, stop extracting
+                }
+
+                // remove and get the first packet
+                let payload = self.unordered_packets.remove(&seq).unwrap();
+                let payload_len = payload.len();
+
+                if payload_len <= remaining_bytes {
+                    // current packet can be fully extracted
+                    data.extend(payload);
+                    self.ack += payload_len as u32;
+                    remaining_bytes -= payload_len;
+                } else {
+                    // current packet can only be partially extracted
+                    data.extend(payload[..remaining_bytes].to_vec());
+                    let remaining_payload = payload[remaining_bytes..].to_vec();
+                    self.ack += remaining_bytes as u32;
+                    self.unordered_packets.insert(self.ack, remaining_payload);
+                    break;
+                }
+            } else {
+                break; // no more packets to extract
+            }
+        }
+
+        if data.is_empty() {
+            None
+        } else {
+            Some(data)
+        }
     }
 
     pub(super) fn increase_seq(&mut self) {
@@ -388,4 +425,41 @@ fn test_in_flight_packet() {
     assert!(p.contains_seq_num(2.into()));
 
     assert!(!p.contains_seq_num(3.into()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_unordered_packets_with_max_bytes() {
+        let mut tcb = Tcb::new(SeqNum(1000), 1460);
+
+        // insert 3 consecutive packets
+        tcb.add_unordered_packet(SeqNum(1000), vec![1; 500]); // seq=1000, len=500
+        tcb.add_unordered_packet(SeqNum(1500), vec![2; 500]); // seq=1500, len=500
+        tcb.add_unordered_packet(SeqNum(2000), vec![3; 500]); // seq=2000, len=500
+
+        // test 1: extract up to 700 bytes
+        let data = tcb.get_unordered_packets(700).unwrap();
+        assert_eq!(data.len(), 700); // extract 500 + 200
+        assert_eq!(data[..500], vec![1; 500]); // the first packet
+        assert_eq!(data[500..700], vec![2; 200]); // the first 200 bytes of the second packet
+        assert_eq!(tcb.ack, SeqNum(1700)); // ack increased by 700
+        assert_eq!(tcb.unordered_packets.len(), 2); // remaining two packets
+        assert_eq!(tcb.unordered_packets.get(&SeqNum(1700)).unwrap().len(), 300); // the second packet remaining 300 bytes
+        assert_eq!(tcb.unordered_packets.get(&SeqNum(2000)).unwrap().len(), 500); // the third packet unchanged
+
+        // test 2: extract up to 800 bytes
+        let data = tcb.get_unordered_packets(800).unwrap();
+        assert_eq!(data.len(), 800); // extract 300 bytes of the second packet and the third packet
+        assert_eq!(data[..300], vec![2; 300]); // the remaining 300 bytes of the second packet
+        assert_eq!(data[300..800], vec![3; 500]); // the third packet
+        assert_eq!(tcb.ack, SeqNum(2500)); // ack increased by 800
+        assert_eq!(tcb.unordered_packets.len(), 0); // no remaining packets
+
+        // test 3: no data to extract
+        let data = tcb.get_unordered_packets(1000);
+        assert!(data.is_none());
+    }
 }
