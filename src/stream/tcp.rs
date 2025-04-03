@@ -226,13 +226,20 @@ impl AsyncRead for IpStackTcpStream {
             use std::io::Error;
             let final_reset = state == TcpState::TimeWait;
             if matches!(Pin::new(&mut self.timeout).poll(cx), Poll::Ready(_)) {
-                if !final_reset {
-                    log::warn!("{network_tuple}: timeout reached");
+                let (seq, ack) = (self.tcb.get_seq().0, self.tcb.get_ack().0);
+                let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
+                if final_reset {
+                    log::trace!("{network_tuple} {state:?}: {l_info}, timeout reached, closing session regularly...");
+                } else {
+                    log::warn!("{network_tuple} {state:?}: {l_info}, session timeout reached, closing forcefully...");
                     // self.tcb.on_retransmit(); // timeout trigger retransmit
+                    self.write_packet_to_device(ACK | RST, None, None)?;
                 }
-                self.write_packet_to_device(ACK | RST, None, None)?;
                 self.tcb.change_state(TcpState::Closed);
                 self.shutdown.ready();
+                if final_reset {
+                    continue;
+                }
                 return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
             }
             self.reset_timeout(final_reset);
