@@ -86,7 +86,7 @@ impl IpStackTcpStream {
             stream_sender,
             stream_receiver,
             up_packet_sender,
-            tcb: Tcb::new(SeqNum(tcp.sequence_number) + 1, mss),
+            tcb: Tcb::new(SeqNum(tcp.sequence_number), mss),
             mtu,
             shutdown: Shutdown::None,
             read_notify_for_shutdown: None,
@@ -245,6 +245,7 @@ impl AsyncRead for IpStackTcpStream {
             self.reset_timeout(final_reset);
 
             if state == TcpState::Listen {
+                self.tcb.increase_ack();
                 let sessions = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 let (seq, ack) = (self.tcb.get_seq().0, self.tcb.get_ack().0);
                 let l_info = format!("local {{ seq: {seq}, ack: {ack} }}");
@@ -267,7 +268,6 @@ impl AsyncRead for IpStackTcpStream {
             if state == TcpState::CloseWait {
                 self.write_packet_to_device(ACK | FIN, None, None)?;
                 self.tcb.increase_seq();
-                self.tcb.increase_ack();
                 self.tcb.change_state(TcpState::LastAck);
                 continue;
             }
@@ -424,7 +424,6 @@ impl AsyncRead for IpStackTcpStream {
                         }
                         if flags & ACK == ACK && len == 0 {
                             self.tcb.update_last_received_ack(incoming_ack);
-                            self.tcb.increase_ack();
                             self.tcb.change_state(TcpState::FinWait2);
                             continue;
                         }
