@@ -1,6 +1,6 @@
 use super::{reno::Reno, seqnum::SeqNum};
 use etherparse::TcpHeader;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 
 // const MAX_UNACK: u32 = 1024 * 16; // 16KB
 const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
@@ -43,7 +43,7 @@ pub(super) struct Tcb {
     duplicate_ack_count: usize,
     state: TcpState,
     reno: Reno,
-    inflight_packets: VecDeque<InflightPacket>,
+    inflight_packets: BTreeMap<SeqNum, InflightPacket>,
     unordered_packets: BTreeMap<SeqNum, Vec<u8>>,
 }
 
@@ -76,7 +76,7 @@ impl Tcb {
             duplicate_ack_count: 0,
             state: TcpState::Listen,
             reno: Reno::new(mss),
-            inflight_packets: VecDeque::new(),
+            inflight_packets: BTreeMap::new(),
             unordered_packets: BTreeMap::new(),
         }
     }
@@ -349,7 +349,7 @@ impl Tcb {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Empty payload"));
         }
         let buf_len = buf.len() as u32;
-        self.inflight_packets.push_back(InflightPacket::new(self.seq, buf));
+        self.inflight_packets.insert(self.seq, InflightPacket::new(self.seq, buf));
         self.seq += buf_len;
         Ok(())
     }
@@ -359,28 +359,45 @@ impl Tcb {
     }
 
     pub(crate) fn update_inflight_packet_queue(&mut self, ack: SeqNum) {
-        if let Some(index) = self.inflight_packets.iter().position(|p| p.contains_seq_num(ack - 1)) {
-            let Some(mut inflight_packet) = self.inflight_packets.remove(index) else {
-                log::warn!("Failed to find inflight packet with seq = {}", ack - 1);
-                return;
-            };
+        match self.inflight_packets.first_key_value() {
+            None => return,
+            Some((&seq, _)) if ack < seq => return,
+            _ => {}
+        }
+        let mut total_confirmed_bytes = 0;
+        if let Some(seq) = self
+            .inflight_packets
+            .iter()
+            .find(|(_, p)| p.contains_seq_num(ack - 1))
+            .map(|(&s, _)| s)
+        {
+            let mut inflight_packet = self.inflight_packets.remove(&seq).unwrap();
             let distance = ack.distance(inflight_packet.seq) as usize;
             if distance < inflight_packet.payload.len() {
                 inflight_packet.payload.drain(0..distance);
                 inflight_packet.seq = ack;
-                self.inflight_packets.push_back(inflight_packet);
+                self.inflight_packets.insert(ack, inflight_packet);
             }
-            self.reno.on_ack(distance); // recived ACK, update Reno's cwnd
+            total_confirmed_bytes += distance;
         }
-        self.inflight_packets.retain(|p| ack < p.seq + (p.payload.len() as u32));
+        self.inflight_packets.retain(|_, p| {
+            let result = ack < p.seq + p.payload.len() as u32;
+            if !result {
+                total_confirmed_bytes += p.payload.len();
+            }
+            result
+        });
+        if total_confirmed_bytes > 0 {
+            self.reno.on_ack(total_confirmed_bytes); // recived ACK, update Reno's cwnd
+        }
     }
 
     pub(crate) fn find_inflight_packet(&self, seq: SeqNum) -> Option<&InflightPacket> {
-        self.inflight_packets.iter().find(|p| p.seq == seq)
+        self.inflight_packets.get(&seq)
     }
 
-    pub(crate) fn get_all_inflight_packets(&self) -> &VecDeque<InflightPacket> {
-        &self.inflight_packets
+    pub(crate) fn get_all_inflight_packets(&self) -> Vec<&InflightPacket> {
+        self.inflight_packets.values().collect::<Vec<_>>()
     }
 
     pub fn is_send_buffer_full(&self) -> bool {
@@ -389,7 +406,7 @@ impl Tcb {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct InflightPacket {
     pub seq: SeqNum,
     pub payload: Vec<u8>,
@@ -409,22 +426,22 @@ impl InflightPacket {
     }
 }
 
-#[test]
-fn test_in_flight_packet() {
-    let p = InflightPacket::new((u32::MAX - 1).into(), vec![10, 20, 30, 40, 50]);
-
-    assert!(p.contains_seq_num((u32::MAX - 1).into()));
-    assert!(p.contains_seq_num(u32::MAX.into()));
-    assert!(p.contains_seq_num(0.into()));
-    assert!(p.contains_seq_num(1.into()));
-    assert!(p.contains_seq_num(2.into()));
-
-    assert!(!p.contains_seq_num(3.into()));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_in_flight_packet() {
+        let p = InflightPacket::new((u32::MAX - 1).into(), vec![10, 20, 30, 40, 50]);
+
+        assert!(p.contains_seq_num((u32::MAX - 1).into()));
+        assert!(p.contains_seq_num(u32::MAX.into()));
+        assert!(p.contains_seq_num(0.into()));
+        assert!(p.contains_seq_num(1.into()));
+        assert!(p.contains_seq_num(2.into()));
+
+        assert!(!p.contains_seq_num(3.into()));
+    }
 
     #[test]
     fn test_get_unordered_packets_with_max_bytes() {
@@ -456,5 +473,46 @@ mod tests {
         // test 3: no data to extract
         let data = tcb.get_unordered_packets(1000);
         assert!(data.is_none());
+    }
+
+    #[test]
+    fn test_update_inflight_packet_queue() {
+        let mut tcb = Tcb::new(SeqNum(1000), 1460);
+        tcb.seq = SeqNum(100); // setting the initial seq
+
+        // insert 3 consecutive packets
+        tcb.add_inflight_packet(vec![1; 500]).unwrap(); // seq=100, len=500
+        tcb.add_inflight_packet(vec![2; 500]).unwrap(); // seq=600, len=500
+        tcb.add_inflight_packet(vec![3; 500]).unwrap(); // seq=1100, len=500
+
+        // test 1: confirm partial packets (ack=800)
+        tcb.update_inflight_packet_queue(SeqNum(800));
+        assert_eq!(tcb.inflight_packets.len(), 2); // remaining two packets
+        let first_packet = tcb.inflight_packets.first_key_value().unwrap().1;
+        assert_eq!(first_packet.seq, SeqNum(800)); // the remaining part of the first packet
+        assert_eq!(first_packet.payload.len(), 300); // remaining 300 bytes in the first packet
+        let second_packet = tcb.inflight_packets.last_key_value().unwrap().1;
+        assert_eq!(second_packet.seq, SeqNum(1100)); // no change in the second packet
+
+        // test 2: confirm all packets (ack=2000)
+        tcb.update_inflight_packet_queue(SeqNum(2000));
+        assert_eq!(tcb.inflight_packets.len(), 0); // all packets are acknowledged
+    }
+
+    #[test]
+    fn test_update_inflight_packet_queue_cumulative_ack() {
+        let mut tcb = Tcb::new(SeqNum(1000), 1460);
+        tcb.seq = SeqNum(1000);
+
+        // Insert 3 consecutive packets
+        tcb.add_inflight_packet(vec![1; 500]).unwrap(); // seq=1000, len=500
+        tcb.add_inflight_packet(vec![2; 500]).unwrap(); // seq=1500, len=500
+        tcb.add_inflight_packet(vec![3; 500]).unwrap(); // seq=2000, len=500
+
+        // Emulate cumulative ACK: ack=2500
+        tcb.update_inflight_packet_queue(SeqNum(2500));
+        assert_eq!(tcb.inflight_packets.len(), 0); // all packets should be removed
+
+        // Check if Reno is updated correctly (assuming Reno has a method to check the number of acknowledged bytes)
     }
 }
