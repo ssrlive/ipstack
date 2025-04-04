@@ -299,6 +299,8 @@ impl AsyncRead for IpStackTcpStream {
                         return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset)));
                     }
 
+                    self.tcb.update_inflight_packet_queue(incoming_ack);
+
                     self.tcb.update_duplicate_ack_count(incoming_ack);
 
                     let pkt_type = self.tcb.check_pkt_type(tcp_header, payload);
