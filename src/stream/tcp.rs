@@ -232,7 +232,6 @@ impl AsyncRead for IpStackTcpStream {
                     log::trace!("{network_tuple} {state:?}: {l_info}, timeout reached, closing session regularly...");
                 } else {
                     log::warn!("{network_tuple} {state:?}: {l_info}, session timeout reached, closing forcefully...");
-                    // self.tcb.on_retransmit(); // timeout trigger retransmit
                     self.write_packet_to_device(ACK | RST, None, None)?;
                 }
                 self.tcb.change_state(TcpState::Closed);
@@ -254,6 +253,15 @@ impl AsyncRead for IpStackTcpStream {
                 self.tcb.increase_seq();
                 self.tcb.change_state(TcpState::SynReceived);
                 continue;
+            }
+
+            if let Some(mut packets) = self.tcb.gather_inflight_packets_for_retransmit() {
+                self.tcb.on_retransmit(); // timeout trigger retransmit
+                while let Some(p) = packets.pop() {
+                    let ack = self.tcb.get_ack().0;
+                    log::debug!("{network_tuple} {state:?}: retransmitting packet, seq: {}, ack: {}", p.seq, ack);
+                    self.write_packet_to_device(ACK | PSH, Some(p.seq), Some(p.payload))?;
+                }
             }
 
             if let Some(data) = self.tcb.get_unordered_packets(buf.remaining()) {

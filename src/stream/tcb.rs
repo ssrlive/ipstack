@@ -40,6 +40,7 @@ pub(super) struct Tcb {
     seq: SeqNum,
     ack: SeqNum,
     last_received_ack: SeqNum,
+    duplicate_ack_count_helper: SeqNum,
     duplicate_ack_count: usize,
     state: TcpState,
     reno: Reno,
@@ -49,11 +50,11 @@ pub(super) struct Tcb {
 
 impl Tcb {
     pub fn update_duplicate_ack_count(&mut self, rcvd_ack: SeqNum) {
-        // If the received rcvd_ack is the same as self.last_received_ack and not all data has been acknowledged (rcvd_ack < self.seq), increment the count.
-        if rcvd_ack == self.last_received_ack && rcvd_ack < self.seq {
+        // If the received rcvd_ack is the same as self.duplicate_ack_count_helper and not all data has been acknowledged (rcvd_ack < self.seq), increment the count.
+        if rcvd_ack == self.duplicate_ack_count_helper && rcvd_ack < self.seq {
             self.duplicate_ack_count = self.duplicate_ack_count.saturating_add(1);
         } else {
-            // self.last_received_ack = rcvd_ack;
+            self.duplicate_ack_count_helper = rcvd_ack;
             self.duplicate_ack_count = 0; // reset duplicate ACK count
         }
     }
@@ -73,6 +74,7 @@ impl Tcb {
             seq: seq.into(),
             ack,
             last_received_ack: seq.into(),
+            duplicate_ack_count_helper: seq.into(),
             duplicate_ack_count: 0,
             state: TcpState::Listen,
             reno: Reno::new(mss),
@@ -165,7 +167,6 @@ impl Tcb {
     }
 
     // call on_retransmit when TCP packet transmission timeout
-    #[allow(dead_code)]
     pub(crate) fn on_retransmit(&mut self) {
         self.reno.on_retransmit();
     }
@@ -193,7 +194,7 @@ impl Tcb {
         let has_ack = tcp_header.ack;
 
         let cwnd = self.reno.window() as u16;
-        let last_received_ack = self.last_received_ack;
+        let last_received_ack = self.get_last_received_ack();
         let local_seq = self.seq;
         let local_ack = self.ack;
         let duplicate_ack_count = self.get_duplicate_ack_count();
@@ -402,7 +403,32 @@ impl Tcb {
 
     pub fn is_send_buffer_full(&self) -> bool {
         let effective_window = self.reno.window().min(u16::MAX as usize) as u32;
-        (self.seq - self.last_received_ack).0 >= effective_window
+        (self.seq - self.get_last_received_ack()).0 >= effective_window
+    }
+}
+
+// Retransmission Timeout
+const RTO: std::time::Duration = std::time::Duration::from_millis(1000);
+
+impl Tcb {
+    // gather all inflight packets that are timed out and return them for retransmission
+    pub fn gather_inflight_packets_for_retransmit(&mut self) -> Option<Vec<InflightPacket>> {
+        let now = std::time::Instant::now();
+
+        let mut packets_to_retransmit = Vec::new();
+        for (&seq, packet) in self.inflight_packets.iter_mut() {
+            if packet.is_timed_out(RTO) {
+                log::debug!("Packet with seq {seq} timed out, marking for retransmission...");
+                packet.send_time = now; // update the send time
+                packets_to_retransmit.push(packet.clone()); // clone the packet for retransmission
+            }
+        }
+
+        if !packets_to_retransmit.is_empty() {
+            Some(packets_to_retransmit)
+        } else {
+            None
+        }
     }
 }
 
@@ -410,7 +436,7 @@ impl Tcb {
 pub struct InflightPacket {
     pub seq: SeqNum,
     pub payload: Vec<u8>,
-    // pub send_time: SystemTime, // todo
+    pub send_time: std::time::Instant,
 }
 
 impl InflightPacket {
@@ -418,11 +444,14 @@ impl InflightPacket {
         Self {
             seq,
             payload,
-            // send_time: SystemTime::now(), // todo
+            send_time: std::time::Instant::now(),
         }
     }
     pub(crate) fn contains_seq_num(&self, seq: SeqNum) -> bool {
         self.seq <= seq && seq < self.seq + self.payload.len() as u32
+    }
+    pub fn is_timed_out(&self, rto: std::time::Duration) -> bool {
+        self.send_time.elapsed() >= rto
     }
 }
 
